@@ -1,0 +1,80 @@
+name: PR → Zoho Sheet sync
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # UTC; GitHub may delay scheduled runs by a few minutes
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Sync mode'
+        type: choice
+        options: [incremental, full, existing]
+        default: incremental
+
+# Never let two syncs run at once
+concurrency:
+  group: pr-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # --- secrets (Settings → Secrets and variables → Actions → Secrets)
+      BITBUCKET_ACCESS_TOKEN: ${{ secrets.BITBUCKET_ACCESS_TOKEN }}
+      BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+      BITBUCKET_CLIENT_SECRET: ${{ secrets.BITBUCKET_CLIENT_SECRET }}
+      ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+      ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+      # --- plain config (Settings → Secrets and variables → Actions → Variables)
+      BITBUCKET_WORKSPACE: ${{ vars.BITBUCKET_WORKSPACE }}
+      BITBUCKET_REPOSITORY: ${{ vars.BITBUCKET_REPOSITORY }}
+      BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+      BITBUCKET_CLIENT_ID: ${{ vars.BITBUCKET_CLIENT_ID }}
+      ZOHO_CLIENT_ID: ${{ vars.ZOHO_CLIENT_ID }}
+      ZOHO_ACCOUNTS_URL: ${{ vars.ZOHO_ACCOUNTS_URL }}
+      ZOHO_SHEET_API_URL: ${{ vars.ZOHO_SHEET_API_URL }}
+      ZOHO_SHEET_ID: ${{ vars.ZOHO_SHEET_ID }}
+      ZOHO_WORKSHEET_NAME: ${{ vars.ZOHO_WORKSHEET_NAME }}
+      ZOHO_MAPPING_WORKSHEET_NAME: ${{ vars.ZOHO_MAPPING_WORKSHEET_NAME }}
+      ZOHO_REVIEWER_LEVELS_WORKSHEET_NAME: ${{ vars.ZOHO_REVIEWER_LEVELS_WORKSHEET_NAME }}
+      ZOHO_INTERACTIVE_WORKSHEETS: ${{ vars.ZOHO_INTERACTIVE_WORKSHEETS }}
+      ZOHO_MIN_REQUEST_INTERVAL_MS: ${{ vars.ZOHO_MIN_REQUEST_INTERVAL_MS }}
+      SYNC_INITIAL_LOOKBACK_DAYS: ${{ vars.SYNC_INITIAL_LOOKBACK_DAYS }}
+      SYNC_INSERT_UNMAPPED_PRS: ${{ vars.SYNC_INSERT_UNMAPPED_PRS }}
+      SHEET_TIMEZONE: ${{ vars.SHEET_TIMEZONE }}
+      SYNC_STATE_FILE: .sync-state.json
+      LOG_FORMAT: text
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      # Carry the incremental watermark between runs. Caches are immutable,
+      # so each run saves under a new key and restores the most recent one.
+      - name: Restore sync state
+        uses: actions/cache/restore@v4
+        with:
+          path: .sync-state.json
+          key: sync-state-${{ github.run_id }}
+          restore-keys: sync-state-
+
+      - name: Run sync
+        run: |
+          case "${{ inputs.mode }}" in
+            full)     node dist/index.js --full ;;
+            existing) node dist/index.js --existing ;;
+            *)        node dist/index.js ;;
+          esac
+
+      - name: Save sync state
+        if: always() && hashFiles('.sync-state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .sync-state.json
+          key: sync-state-${{ github.run_id }}

@@ -1,0 +1,27 @@
+{
+  "name": "bitbucket-zoho-sheet-sync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic sync of Bitbucket Cloud PR reviewer data into a Zoho Sheet",
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "sync": "tsx src/index.ts",
+    "sync:full": "tsx src/index.ts --full",
+    "schedule": "tsx src/scheduler.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/scheduler.js",
+    "sync:prod": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "zoho:token": "node scripts/zoho-token.mjs",
+    "sync:existing": "tsx src/index.ts --existing"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
