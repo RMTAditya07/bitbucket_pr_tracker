@@ -14,17 +14,34 @@ import {
   fillBlankManualFields,
   formatDateTime,
   normalizePrState,
+  QUEUE_COLUMNS,
   resolveManualFields,
   type PrMapping,
   type RowValues,
 } from './mapper.js';
+import {
+  findRota,
+  firstReviewAt,
+  planQueue,
+  resolveDependencies,
+  workingDaysBetween,
+  type PrTimeline,
+  type ReviewerQueue,
+  type RotaEntry,
+  type TimelineSource,
+} from './queue.js';
 
 // ---------------------------------------------------------------------------
 // Ports — implemented by the Bitbucket / Zoho adapters and by in-memory fakes in tests.
 // ---------------------------------------------------------------------------
 
+export interface OpenPullRequest {
+  id: number;
+  sourceBranch?: string;
+}
+
 export interface PullRequestSource {
-  listOpenPullRequestIds(): Promise<number[]>;
+  listOpenPullRequests(): Promise<OpenPullRequest[]>;
   listPullRequestIdsUpdatedSince(since: Date | null): Promise<number[]>;
   getPullRequest(id: number): Promise<BbPullRequest | null>;
 }
@@ -54,6 +71,8 @@ export interface SheetStore {
   readReviewerLevels(): Promise<ReviewerLevel[]>;
   /** Known interactives (Static/Dynamic Interactives worksheets). Empty = auto-detection off. */
   readInteractives?(): Promise<InteractiveEntry[]>;
+  /** Review Rota worksheet. Empty = every PR uses engaged mode. */
+  readReviewRota?(): Promise<RotaEntry[]>;
   insertRows(rows: RowValues[]): Promise<void>;
   updateRows(match: RowMatch, values: RowValues): Promise<void>;
 }
@@ -68,6 +87,8 @@ export interface SyncDeps {
   timeZone: string;
   /** Insert rows for PRs with no interactive mapping, leaving the manual columns blank. */
   insertUnmapped?: boolean;
+  /** Review history per PR, for the review-queue columns. Omitted = those columns are not written. */
+  timelines?: TimelineSource;
   now?: () => Date;
 }
 
@@ -128,9 +149,15 @@ export async function runSync(deps: SyncDeps, options: SyncOptions = {}): Promis
     const rescanUnnamed =
       index.interactives.fingerprint !== '' &&
       index.interactives.fingerprint !== (options.previousInteractivesFingerprint ?? null);
+    // Open PRs drive discovery, and dependency detection (stacked branches, "is #71 still open?").
+    const keep = columnFilter(sheet);
+    const needsOpen =
+      !options.prIds || Object.keys(keep(blankRow([COL.dependsOn, ...QUEUE_COLUMNS]))).length > 0;
+    const open = needsOpen ? await source.listOpenPullRequests() : null;
+    if (open) indexOpenPrs(index, open);
     const prIds = options.prIds
       ? dedupe(options.prIds)
-      : await discoverPrIds(source, index, options.since ?? null, rescanUnnamed, logger);
+      : await discoverPrIds(source, index, open!, options.since ?? null, rescanUnnamed, logger);
     summary.prsConsidered = prIds.length;
 
     for (let i = 0; i < prIds.length; i++) {
@@ -183,14 +210,19 @@ interface SheetIndex {
   levelsByName: Map<string, string>;
   warnedLevels: Set<string>;
   interactives: InteractiveMatcher;
+  /** Open PRs; null when not listed this run (targeted run without dependency/queue columns). */
+  openIds: Set<number> | null;
+  openBySourceBranch: Map<string, number>;
+  rota: RotaEntry[];
 }
 
 async function loadSheetIndex(sheet: SheetStore, logger: Logger): Promise<SheetIndex> {
-  const [rows, mappings, levels, interactives] = await Promise.all([
+  const [rows, mappings, levels, interactives, rota] = await Promise.all([
     sheet.readRows(),
     sheet.readPrMappings(),
     sheet.readReviewerLevels(),
     sheet.readInteractives?.() ?? Promise.resolve([]),
+    sheet.readReviewRota?.() ?? Promise.resolve([]),
   ]);
 
   const index: SheetIndex = {
@@ -201,6 +233,9 @@ async function loadSheetIndex(sheet: SheetStore, logger: Logger): Promise<SheetI
     levelsByName: new Map(),
     warnedLevels: new Set(),
     interactives: buildMatcher(interactives),
+    openIds: null,
+    openBySourceBranch: new Map(),
+    rota,
   };
 
   for (const row of rows) indexRow(index, row);
@@ -232,6 +267,11 @@ async function loadSheetIndex(sheet: SheetStore, logger: Logger): Promise<SheetI
   return index;
 }
 
+function indexOpenPrs(index: SheetIndex, open: OpenPullRequest[]): void {
+  index.openIds = new Set(open.map((p) => p.id));
+  for (const p of open) if (p.sourceBranch) index.openBySourceBranch.set(p.sourceBranch, p.id);
+}
+
 function indexRow(index: SheetIndex, row: SheetRow): void {
   const key = String(row.values[COL.syncKey] ?? '').trim();
   if (key) push(index.byKey, key, row);
@@ -246,11 +286,12 @@ function indexRow(index: SheetIndex, row: SheetRow): void {
 async function discoverPrIds(
   source: PullRequestSource,
   index: SheetIndex,
+  openPrs: OpenPullRequest[],
   since: Date | null,
   rescanUnnamed: boolean,
   logger: Logger,
 ): Promise<number[]> {
-  const open = await source.listOpenPullRequestIds();
+  const open = openPrs.map((p) => p.id);
   const changed = await source.listPullRequestIdsUpdatedSince(since);
   const openSet = new Set(open);
 
@@ -370,6 +411,48 @@ async function syncOnePr(
   const syncedAt = formatDateTime(now(), timeZone);
   const keep = columnFilter(sheet);
   const seenKeys = new Set<string>();
+
+  const timeline = await loadTimeline(pr, deps, keep);
+  const dependencies = resolveDependencies(pr, index.mappings.get(prId)?.dependsOn, index.openBySourceBranch);
+  const openDependencies = dependencies.filter((id) => index.openIds?.has(id));
+  const queueFields = (q: ReviewerQueue): RowValues => {
+    if (!q.state) return {};
+    return {
+      [COL.queueState]: q.state,
+      [COL.waitingOn]: q.waitingOn,
+      [COL.waitingSince]: q.waitingSince ? formatDateTime(q.waitingSince, timeZone) : '',
+      [COL.daysWaiting]: q.waitingSince ? workingDaysBetween(q.waitingSince, now(), timeZone) : '',
+      [COL.reviewRound]: q.reviewRound,
+      [COL.commitsSinceReview]: q.commitsSinceReview,
+    };
+  };
+  // Whose "Waiting for Review" counts (rota reviewers + anyone engaged), then the L2 step.
+  const rota = findRota(index.rota, [authorName, String(manual?.[COL.developer] ?? '')], pr.created_on, timeZone);
+  const plan = timeline
+    ? planQueue({
+        pr,
+        timeline,
+        rota,
+        openDependencies,
+        reviewers: reviewers.map((r) => ({
+          id: r.id,
+          displayName: r.displayName,
+          status: r.status,
+          l2: /^l2$/i.test(lookupLevel(index, r.id, r.displayName, logger) ?? ''),
+        })),
+      })
+    : null;
+  if (plan?.rotaMissing.length && prState.status === 'OPEN') {
+    logger.pr(
+      prId,
+      {
+        action: 'ROTA_REVIEWER_NOT_ON_PR',
+        missing: plan.rotaMissing.join(', '),
+        note: 'Add them as reviewers in Bitbucket (or check the name matches their Bitbucket display name).',
+      },
+      'warn',
+    );
+  }
   let unmappedReviewers = 0;
 
   // Plan every write for this PR first, so PR-level columns (PR Count, Days Open) can be folded
@@ -401,7 +484,9 @@ async function syncOnePr(
     }
 
     const level = lookupLevel(index, reviewer.id, reviewer.displayName, logger);
-    const desired = keep(buildSyncedFields(pr, reviewer, level, timeZone));
+    const planned = plan?.byReviewer.get(reviewer.id);
+    const queue: RowValues = planned ? queueFields(planned) : {};
+    const desired = keep({ ...buildSyncedFields(pr, reviewer, level, timeZone), ...queue });
     const status = reviewer.status ?? `(raw: ${reviewer.rawState})`;
     const base = { key, reviewer: reviewer.displayName, status };
     const keyed = index.byKey.get(key);
@@ -449,17 +534,33 @@ async function syncOnePr(
       row: row.rowIndex,
       note: 'No longer a reviewer in Bitbucket; only PR-level columns are kept up to date.',
     });
-    ops.push({ key, reviewer, status: '(removed)', rows: index.byKey.get(key) ?? [row], changes: {}, match: { syncKey: key } });
+    // Out of the review queue, so reviewer-load pivots stop counting them.
+    const changes = timeline
+      ? diffSyncedFields(
+          row.values,
+          keep(queueFields({ state: 'Removed', waitingOn: '', waitingSince: null, reviewRound: '', commitsSinceReview: '' })),
+        )
+      : {};
+    ops.push({ key, reviewer, status: '(removed)', rows: index.byKey.get(key) ?? [row], changes, match: { syncKey: key } });
   }
 
   // PR Count = 1 on exactly one row per PR (lowest Sync Key), so pivots can SUM it to count PRs.
   const primaryKey = ops.map((o) => o.key).sort()[0];
   const prLevel = (key: string, row: Record<string, unknown>): RowValues => {
     const drop = buildDropFor(index, cellText(row[COL.interactiveName]));
+    const reviewedAt = timeline ? firstReviewAt(pr, timeline) : null;
     return keep({
       [COL.prCount]: key === primaryKey ? 1 : 0,
-      [COL.daysOpen]: daysOpen(pr, now()),
+      [COL.daysOpen]: daysOpen(pr, now(), timeline?.mergedAt),
       ...(drop === undefined ? {} : { [COL.buildDropDate]: drop }),
+      ...(plan?.prState ? { [COL.prQueueState]: plan.prState } : {}),
+      ...(timeline
+        ? {
+            [COL.firstReviewAt]: reviewedAt ? formatDateTime(reviewedAt, timeZone) : '',
+            [COL.mergedAt]: timeline.mergedAt ? formatDateTime(timeline.mergedAt, timeZone) : '',
+          }
+        : {}),
+      ...(index.openIds ? { [COL.dependsOn]: dependencies.map((id) => `#${id}`).join(', ') } : {}),
     });
   };
 
@@ -520,6 +621,33 @@ async function syncOnePr(
       'warn',
     );
   }
+}
+
+/**
+ * The PR's review history, or null when the sheet has no review-queue columns (no extra
+ * Bitbucket calls) or it could not be fetched. A failure only skips the queue columns.
+ */
+async function loadTimeline(
+  pr: BbPullRequest,
+  deps: SyncDeps,
+  keep: (v: RowValues) => RowValues,
+): Promise<PrTimeline | null> {
+  if (!deps.timelines || Object.keys(keep(blankRow(QUEUE_COLUMNS))).length === 0) return null;
+  try {
+    return await deps.timelines.get(pr);
+  } catch (err) {
+    if (isFatal(err)) throw err;
+    deps.logger.pr(
+      pr.id,
+      { action: 'TIMELINE_FAILED', error: errorMessage(err), note: 'Review-queue columns left unchanged this run' },
+      'warn',
+    );
+    return null;
+  }
+}
+
+function blankRow(columns: readonly string[]): RowValues {
+  return Object.fromEntries(columns.map((c) => [c, '']));
 }
 
 /**

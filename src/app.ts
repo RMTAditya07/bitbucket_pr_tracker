@@ -1,5 +1,6 @@
 import { BitbucketClient } from './bitbucket/client.js';
 import { BitbucketPullRequests } from './bitbucket/pullRequests.js';
+import { BitbucketTimelines, CachingTimelines } from './bitbucket/timeline.js';
 import { secretValues, type Config } from './config/env.js';
 import type { Logger } from './logger/logger.js';
 import { readState, sinceFromState, writeState } from './sync/state.js';
@@ -14,6 +15,7 @@ export function createSyncDeps(config: Config, logger: Logger): SyncDeps {
   const zoho = new ZohoClient(config.zoho, config.http, logger);
   return {
     source: new BitbucketPullRequests(bitbucket),
+    timelines: new BitbucketTimelines(bitbucket),
     sheet: new ZohoSheetStore(zoho, config.zoho, logger),
     logger,
     timeZone: config.sync.timezone,
@@ -31,15 +33,26 @@ export async function runIncrementalSync(
   const state = opts.full ? null : await readState(config.sync.stateFile);
   const since = opts.full ? null : sinceFromState(state, config.sync.initialLookbackDays, startedAt);
 
-  const summary = await runSync(deps, {
-    since,
-    previousInteractivesFingerprint: state?.interactivesFingerprint ?? null,
-  });
+  const timelines = deps.timelines ? new CachingTimelines(deps.timelines, state?.timelines) : undefined;
+
+  const summary = await runSync(
+    { ...deps, timelines },
+    { since, previousInteractivesFingerprint: state?.interactivesFingerprint ?? null },
+  );
+  if (timelines) {
+    const cached = Object.keys(timelines.entries()).length;
+    deps.logger.event('info', 'TIMELINES', {
+      fetched: timelines.fetched,
+      fromCache: cached - timelines.fetched,
+      threadsRefreshed: timelines.threadsRefreshed,
+    });
+  }
 
   if (!summary.aborted && summary.failed === 0) {
     await writeState(config.sync.stateFile, {
       lastSuccessfulSyncStartedAt: startedAt.toISOString(),
       interactivesFingerprint: summary.interactivesFingerprint,
+      timelines: timelines?.entries(),
     });
   }
   return summary;

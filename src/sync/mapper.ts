@@ -31,6 +31,17 @@ export const COL = {
   prCount: 'PR Count',
   daysOpen: 'Days Open',
   buildDropDate: 'Build Drop Date',
+  // Review queue (optional columns; see src/sync/queue.ts)
+  queueState: 'Queue State',
+  prQueueState: 'PR Queue State',
+  waitingOn: 'Waiting On',
+  waitingSince: 'Waiting Since',
+  daysWaiting: 'Days Waiting',
+  reviewRound: 'Review Round',
+  commitsSinceReview: 'Commits Since Review',
+  firstReviewAt: 'First Review At',
+  mergedAt: 'Merged At',
+  dependsOn: 'Depends On',
   syncKey: 'Sync Key',
 } as const;
 
@@ -60,9 +71,36 @@ export const SYNCED_COLUMNS: readonly string[] = [
   COL.targetBranch,
   COL.createdAt,
   COL.updatedAt,
+  COL.queueState,
+  COL.waitingOn,
+  COL.waitingSince,
+  COL.daysWaiting,
+  COL.reviewRound,
+  COL.commitsSinceReview,
 ];
 
-const DATE_COLUMNS = new Set<string>([COL.createdAt, COL.updatedAt, COL.lastSyncedAt, COL.buildDropDate]);
+/** Review-queue columns. Timelines are fetched from Bitbucket only if the sheet has one of them. */
+export const QUEUE_COLUMNS: readonly string[] = [
+  COL.queueState,
+  COL.prQueueState,
+  COL.waitingOn,
+  COL.waitingSince,
+  COL.daysWaiting,
+  COL.reviewRound,
+  COL.commitsSinceReview,
+  COL.firstReviewAt,
+  COL.mergedAt,
+];
+
+const DATE_COLUMNS = new Set<string>([
+  COL.createdAt,
+  COL.updatedAt,
+  COL.lastSyncedAt,
+  COL.buildDropDate,
+  COL.waitingSince,
+  COL.firstReviewAt,
+  COL.mergedAt,
+]);
 
 // ---------------------------------------------------------------------------
 // State normalization
@@ -222,13 +260,17 @@ function clock(h?: string, mi?: string, sec?: string, ampm?: string): [number, n
 }
 
 /**
- * Whole days the PR has been (or was) open: until now while OPEN, otherwise until its last
- * update. Bitbucket's PR payload has no merged/closed timestamp, so for closed PRs
- * `updated_on` is used — accurate unless someone commented after it was closed.
+ * Whole days the PR has been (or was) open: until now while OPEN, otherwise until it was merged
+ * (`mergedAt`, from the activity feed) or, failing that, its last update. The PR payload has no
+ * closed timestamp, so without `mergedAt` a comment after closing extends it.
  */
-export function daysOpen(pr: Pick<BbPullRequest, 'state' | 'created_on' | 'updated_on'>, now: Date): number {
+export function daysOpen(
+  pr: Pick<BbPullRequest, 'state' | 'created_on' | 'updated_on'>,
+  now: Date,
+  mergedAt?: string | null,
+): number {
   const start = Date.parse(pr.created_on);
-  const end = normalizePrState(pr.state).status === 'OPEN' ? now.getTime() : Date.parse(pr.updated_on);
+  const end = normalizePrState(pr.state).status === 'OPEN' ? now.getTime() : Date.parse(mergedAt ?? pr.updated_on);
   if (Number.isNaN(start) || Number.isNaN(end)) return 0;
   return Math.max(0, Math.floor((end - start) / 86_400_000));
 }
@@ -244,6 +286,8 @@ export interface PrMapping {
   interactiveType: string;
   phase: string;
   prLabel: string;
+  /** Manual dependency override ("#71, #72", or "-" for none). Blank = detect automatically. */
+  dependsOn?: string;
 }
 
 /**

@@ -87,7 +87,8 @@ export class ZohoClient {
     this.lastCallAt = Date.now();
   }
 
-  private async accessToken(): Promise<string> {
+  /** Current OAuth access token (refreshed when near expiry); also used for the Cliq API. */
+  async accessToken(): Promise<string> {
     if (this.token && this.token.expiresAt > Date.now() + 60_000) return this.token.value;
 
     const res = await request(

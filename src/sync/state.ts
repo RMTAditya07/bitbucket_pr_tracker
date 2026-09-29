@@ -1,4 +1,5 @@
 import { readFile, rename, writeFile } from 'node:fs/promises';
+import type { CachedTimeline } from '../bitbucket/timeline.js';
 
 /**
  * Incremental-sync watermark. Losing this file is harmless: the next run falls back to the
@@ -9,6 +10,8 @@ export interface SyncState {
   lastSuccessfulSyncStartedAt: string;
   /** Interactives list seen by that run; a change triggers a re-check of unnamed PRs. */
   interactivesFingerprint?: string | null;
+  /** Review history per PR id, re-fetched only when the PR changes. Safe to lose. */
+  timelines?: Record<string, CachedTimeline>;
 }
 
 /** Overlap re-scanned each run to absorb clock skew and in-flight Bitbucket updates. */
@@ -21,6 +24,7 @@ export async function readState(path: string): Promise<SyncState | null> {
       return {
         lastSuccessfulSyncStartedAt: parsed.lastSuccessfulSyncStartedAt,
         interactivesFingerprint: parsed.interactivesFingerprint ?? null,
+        timelines: parsed.timelines ?? {},
       };
     }
   } catch {

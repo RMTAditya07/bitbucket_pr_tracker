@@ -1,8 +1,9 @@
 import type { Config } from '../config/env.js';
 import type { Logger } from '../logger/logger.js';
 import { parsePrId } from '../sync/identity.js';
-import { COL, SHEET_COLUMNS, type CellValue, type PrMapping, type RowValues } from '../sync/mapper.js';
+import { COL, SHEET_COLUMNS, dateCandidates, type CellValue, type PrMapping, type RowValues } from '../sync/mapper.js';
 import type { InteractiveEntry } from '../sync/interactives.js';
+import type { RotaEntry } from '../sync/queue.js';
 import type { ReviewerLevel, RowMatch, SheetRow, SheetStore } from '../sync/synchronizer.js';
 import { ZohoApiError, type ZohoClient } from './client.js';
 
@@ -62,6 +63,7 @@ export class ZohoSheetStore implements SheetStore {
         interactiveType: str(v[COL.interactiveType]),
         phase: str(v[COL.phase]),
         prLabel: str(v[COL.pr]),
+        dependsOn: str(v[COL.dependsOn]),
       });
     }
     return out;
@@ -80,6 +82,37 @@ export class ZohoSheetStore implements SheetStore {
         level: str(v['Level']),
       }))
       .filter((l) => l.level && (l.reviewerId || l.reviewerName));
+  }
+
+  /**
+   * Review Rota: Developer | L1 Reviewer 1 | L1 Reviewer 2 | From | To. Every column whose header
+   * contains the word "Reviewer" is a reviewer. Rows without a readable From date are skipped: an open
+   * start would pull every existing PR into rota mode.
+   */
+  async readReviewRota(): Promise<RotaEntry[]> {
+    if (!this.config.reviewRotaWorksheetName) return [];
+    const rows = await this.fetchOptional(this.config.reviewRotaWorksheetName, 'ZOHO_REVIEW_ROTA_WORKSHEET_NAME');
+    const out: RotaEntry[] = [];
+    for (const { rowIndex, values: v } of rows) {
+      const developer = str(v[COL.developer]);
+      if (!developer) continue;
+      const reviewers = Object.entries(v)
+        .filter(([k, x]) => /\breviewer\b/i.test(k) && str(x))
+        .map(([, x]) => str(x));
+      const from = toIsoDate(str(v['From']));
+      const to = toIsoDate(str(v['To']));
+      if (!from) {
+        this.logger.event('warn', 'ROTA_ROW_SKIPPED', {
+          worksheet: this.config.reviewRotaWorksheetName,
+          row: rowIndex,
+          developer,
+          note: 'From date missing or unreadable (use YYYY-MM-DD).',
+        });
+        continue;
+      }
+      out.push({ developer, reviewers, from, to });
+    }
+    return out;
   }
 
   async readInteractives(): Promise<InteractiveEntry[]> {
@@ -185,6 +218,12 @@ function toZohoCell(v: CellValue): string | number {
   if (typeof v !== 'object') return v;
   const esc = (s: string) => s.replace(/"/g, '""');
   return `=HYPERLINK("${esc(v.url)}","${esc(v.text)}")`;
+}
+
+/** A date cell as YYYY-MM-DD. Ambiguous D/M vs M/D reads day-first (Indian locale). */
+export function toIsoDate(value: string): string | null {
+  const [first] = dateCandidates(value);
+  return first === undefined ? null : new Date(first * 1000).toISOString().slice(0, 10);
 }
 
 function str(v: unknown): string {

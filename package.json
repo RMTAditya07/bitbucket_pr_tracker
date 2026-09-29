@@ -17,7 +17,11 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "zoho:token": "node scripts/zoho-token.mjs",
-    "sync:existing": "tsx src/index.ts --existing"
+    "sync:existing": "tsx src/index.ts --existing",
+    "sync:tracker": "tsx src/trackerSync.ts",
+    "sync:tracker:prod": "node dist/trackerSync.js",
+    "digest": "tsx src/digest.ts",
+    "digest:prod": "node dist/digest.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

@@ -39,6 +39,7 @@ jobs:
       ZOHO_WORKSHEET_NAME: ${{ vars.ZOHO_WORKSHEET_NAME }}
       ZOHO_MAPPING_WORKSHEET_NAME: ${{ vars.ZOHO_MAPPING_WORKSHEET_NAME }}
       ZOHO_REVIEWER_LEVELS_WORKSHEET_NAME: ${{ vars.ZOHO_REVIEWER_LEVELS_WORKSHEET_NAME }}
+      ZOHO_REVIEW_ROTA_WORKSHEET_NAME: ${{ vars.ZOHO_REVIEW_ROTA_WORKSHEET_NAME }}
       ZOHO_INTERACTIVE_WORKSHEETS: ${{ vars.ZOHO_INTERACTIVE_WORKSHEETS }}
       ZOHO_MIN_REQUEST_INTERVAL_MS: ${{ vars.ZOHO_MIN_REQUEST_INTERVAL_MS }}
       SYNC_INITIAL_LOOKBACK_DAYS: ${{ vars.SYNC_INITIAL_LOOKBACK_DAYS }}
@@ -47,10 +48,10 @@ jobs:
       SYNC_STATE_FILE: .sync-state.json
       LOG_FORMAT: text
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run build
@@ -58,7 +59,7 @@ jobs:
       # Carry the incremental watermark between runs. Caches are immutable,
       # so each run saves under a new key and restores the most recent one.
       - name: Restore sync state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .sync-state.json
           key: sync-state-${{ github.run_id }}
@@ -74,7 +75,7 @@ jobs:
 
       - name: Save sync state
         if: always() && hashFiles('.sync-state.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .sync-state.json
           key: sync-state-${{ github.run_id }}

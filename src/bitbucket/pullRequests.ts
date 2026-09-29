@@ -1,4 +1,4 @@
-import type { PullRequestSource } from '../sync/synchronizer.js';
+import type { OpenPullRequest, PullRequestSource } from '../sync/synchronizer.js';
 import type { BitbucketClient } from './client.js';
 import type { BbPullRequest } from './types.js';
 
@@ -7,11 +7,16 @@ const ALL_STATES = ['OPEN', 'MERGED', 'DECLINED', 'SUPERSEDED'];
 export class BitbucketPullRequests implements PullRequestSource {
   constructor(private readonly client: BitbucketClient) {}
 
-  async listOpenPullRequestIds(): Promise<number[]> {
-    const ids: number[] = [];
-    const path = `${this.client.repoPath()}/pullrequests?state=OPEN&pagelen=50&fields=next,values.id`;
-    for await (const pr of this.client.paginate<{ id: number }>(path)) ids.push(pr.id);
-    return ids;
+  /** Open PRs with their source branch (a PR targeting that branch is stacked on it). */
+  async listOpenPullRequests(): Promise<OpenPullRequest[]> {
+    const out: OpenPullRequest[] = [];
+    const path =
+      `${this.client.repoPath()}/pullrequests?state=OPEN&pagelen=50` +
+      `&fields=next,values.id,values.source.branch.name`;
+    for await (const pr of this.client.paginate<{ id: number; source?: { branch?: { name: string } } }>(path)) {
+      out.push({ id: pr.id, sourceBranch: pr.source?.branch?.name });
+    }
+    return out;
   }
 
   /**

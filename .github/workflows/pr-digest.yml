@@ -1,0 +1,77 @@
+name: PR digest → Zoho Cliq
+
+# Each author gets their open PRs by build drop and what each needs next; each reviewer gets the fresh
+# reviews and re-reviews waiting on them. Sent as direct messages from the Cliq bot (CLIQ_BOT_NAME).
+on:
+  schedule:
+    - cron: '0 4 * * 1-5' # 09:30 IST, Mon–Fri: morning digest (UTC; GitHub may delay a few minutes)
+    - cron: '0 13 * * 1-5' # 18:30 IST, Mon–Fri: end-of-day digest
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: 'Digest'
+        type: choice
+        options: [morning, evening]
+        default: morning
+      send:
+        description: 'Send to Cliq (unchecked = dry run, messages only in the log)'
+        type: boolean
+        default: false
+      to:
+        description: 'Only this person (name as in the sheet); blank = everyone'
+        type: string
+        default: ''
+
+# Read-only on the sheet, so it does not join the sync's concurrency group
+# (a queued run in that group would replace a pending sync).
+concurrency:
+  group: pr-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # --- secrets (Settings → Secrets and variables → Actions → Secrets)
+      ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+      ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+      BITBUCKET_ACCESS_TOKEN: ${{ secrets.BITBUCKET_ACCESS_TOKEN }}
+      BITBUCKET_API_TOKEN: ${{ secrets.BITBUCKET_API_TOKEN }}
+      BITBUCKET_CLIENT_SECRET: ${{ secrets.BITBUCKET_CLIENT_SECRET }}
+      # --- plain config (Settings → Secrets and variables → Actions → Variables)
+      CLIQ_BOT_NAME: ${{ vars.CLIQ_BOT_NAME }}
+      CLIQ_API_URL: ${{ vars.CLIQ_API_URL }}
+      CLIQ_USER_MAP: ${{ vars.CLIQ_USER_MAP }}
+      ZOHO_CLIENT_ID: ${{ vars.ZOHO_CLIENT_ID }}
+      ZOHO_ACCOUNTS_URL: ${{ vars.ZOHO_ACCOUNTS_URL }}
+      ZOHO_SHEET_API_URL: ${{ vars.ZOHO_SHEET_API_URL }}
+      ZOHO_SHEET_ID: ${{ vars.ZOHO_SHEET_ID }}
+      ZOHO_WORKSHEET_NAME: ${{ vars.ZOHO_WORKSHEET_NAME }}
+      ZOHO_REVIEW_ROTA_WORKSHEET_NAME: ${{ vars.ZOHO_REVIEW_ROTA_WORKSHEET_NAME }}
+      ZOHO_MIN_REQUEST_INTERVAL_MS: ${{ vars.ZOHO_MIN_REQUEST_INTERVAL_MS }}
+      # Workspace/repository build the PR links; the shared config loader also validates Bitbucket auth
+      BITBUCKET_WORKSPACE: ${{ vars.BITBUCKET_WORKSPACE }}
+      BITBUCKET_REPOSITORY: ${{ vars.BITBUCKET_REPOSITORY }}
+      BITBUCKET_EMAIL: ${{ vars.BITBUCKET_EMAIL }}
+      BITBUCKET_CLIENT_ID: ${{ vars.BITBUCKET_CLIENT_ID }}
+      SHEET_TIMEZONE: ${{ vars.SHEET_TIMEZONE }}
+      LOG_FORMAT: text
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Send digest
+        env:
+          KIND: ${{ github.event_name == 'schedule' && (github.event.schedule == '0 13 * * 1-5' && 'evening' || 'morning') || inputs.kind }}
+          SEND: ${{ github.event_name == 'schedule' || inputs.send }}
+          TO: ${{ inputs.to }}
+        run: |
+          args=(--"$KIND")
+          [ "$SEND" = "true" ] && args+=(--send)
+          [ -n "$TO" ] && args+=(--to "$TO")
+          node dist/digest.js "${args[@]}"

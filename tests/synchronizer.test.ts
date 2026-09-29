@@ -4,7 +4,8 @@ import type { BbPullRequest } from '../src/bitbucket/types.js';
 import { AuthError } from '../src/http/request.js';
 import { silentLogger, type LogFields, type Logger } from '../src/logger/logger.js';
 import type { InteractiveEntry } from '../src/sync/interactives.js';
-import { COL, MANUAL_COLUMNS, cellText, type PrMapping, type RowValues } from '../src/sync/mapper.js';
+import { COL, MANUAL_COLUMNS, QUEUE_COLUMNS, cellText, type PrMapping, type RowValues } from '../src/sync/mapper.js';
+import type { PrTimeline, RotaEntry } from '../src/sync/queue.js';
 import {
   runSync,
   type PullRequestSource,
@@ -28,8 +29,10 @@ class FakeBitbucket implements PullRequestSource {
   put(pr: BbPullRequest) {
     this.prs.set(pr.id, pr);
   }
-  async listOpenPullRequestIds() {
-    return [...this.prs.values()].filter((p) => p.state === 'OPEN').map((p) => p.id);
+  async listOpenPullRequests() {
+    return [...this.prs.values()]
+      .filter((p) => p.state === 'OPEN')
+      .map((p) => ({ id: p.id, sourceBranch: p.source.branch?.name }));
   }
   async listPullRequestIdsUpdatedSince(since: Date | null) {
     return [...this.prs.values()]
@@ -52,6 +55,11 @@ class FakeSheet implements SheetStore {
   updates: Array<{ match: RowMatch; values: RowValues }> = [];
   headers: Set<string> | null = null;
   interactives: InteractiveEntry[] = [];
+  rota: RotaEntry[] = [];
+
+  async readReviewRota() {
+    return this.rota;
+  }
 
   async readInteractives() {
     return this.interactives;
@@ -557,6 +565,202 @@ describe('runSync', () => {
       sheet.headers = new Set(Object.values(COL).filter((c) => c !== COL.buildDropDate));
       await runSync(depsAll());
       assert.ok(sheet.rows.every((r) => !(COL.buildDropDate in r)));
+    });
+  });
+
+  describe('review queue', () => {
+    const A = 'aaaaaaaaaaaa';
+    const B = 'bbbbbbbbbbbb';
+    let timelines: Map<number, PrTimeline | Error>;
+    const depsQ = (logger: Logger = silentLogger) => ({
+      ...deps(logger),
+      timelines: {
+        get: async (pr: BbPullRequest) => {
+          const t = timelines.get(pr.id) ?? { pushes: [], reviews: [], mergedAt: null, commits: [], threads: [] };
+          if (t instanceof Error) throw t;
+          return t;
+        },
+      },
+    });
+    const row = (prId: string, reviewer: string) =>
+      sheet.rows.find((r) => r[COL.prId] === prId && r[COL.reviewer] === reviewer)!;
+
+    beforeEach(() => {
+      sheet.headers = new Set(Object.values(COL));
+      // Shravya requested changes on A (Mon 21 Sep); the author pushed B on Tue 22 Sep.
+      bb.put(
+        makePr({
+          id: 123,
+          source: { branch: { name: 'feature/pr-123' }, commit: { hash: B } },
+          reviewers: [RITHIKA_S, SHRAVYA],
+          participants: [participant(RITHIKA_S, null), participant(SHRAVYA, 'changes_requested')],
+        }),
+      );
+      timelines = new Map([
+        [
+          123,
+          {
+            pushes: [
+              { hash: A, at: '2026-09-01T10:00:00Z' },
+              { hash: B, at: '2026-09-22T08:00:00Z' },
+            ],
+            reviews: [{ reviewerId: SHRAVYA.uuid!, kind: 'changes_requested', at: '2026-09-21T09:00:00Z' }],
+            mergedAt: null,
+            commits: [B, A],
+            threads: [],
+          } satisfies PrTimeline,
+        ],
+      ]);
+    });
+
+    it('writes where each reviewer is stuck, and is idempotent', async () => {
+      await runSync(depsQ());
+      const shravya = row('#123', 'Shravya');
+      assert.equal(shravya[COL.queueState], 'Waiting for Re-review');
+      assert.equal(shravya[COL.waitingOn], 'Shravya');
+      assert.equal(shravya[COL.waitingSince], '2026-09-22 08:00:00');
+      assert.equal(shravya[COL.daysWaiting], 1);
+      assert.equal(shravya[COL.reviewRound], 2);
+      assert.equal(shravya[COL.commitsSinceReview], 1);
+      assert.equal(shravya[COL.firstReviewAt], '2026-09-21 09:00:00');
+      assert.equal(shravya[COL.mergedAt], '');
+      assert.equal(shravya[COL.dependsOn], '');
+
+      // Engaged mode (no rota): Rithika S has not engaged, so she is not in the queue.
+      const rithika = row('#123', 'Rithika S');
+      assert.equal(rithika[COL.queueState], 'Optional');
+      assert.equal(rithika[COL.waitingOn], '');
+      assert.equal(rithika[COL.daysWaiting], '');
+
+      sheet.resetCalls();
+      await runSync(depsQ());
+      assert.equal(sheet.updates.length, 0);
+    });
+
+    it('hands the PR back to the reviewer when the author resolves their threads without pushing', async () => {
+      const t = timelines.get(123) as PrTimeline;
+      bb.put({ ...bb.prs.get(123)!, source: { branch: { name: 'feature/pr-123' }, commit: { hash: A } } });
+      timelines.set(123, { ...t, pushes: t.pushes.slice(0, 1), threads: [
+        { openedBy: SHRAVYA.uuid!, openedAt: '2026-09-21T08:59:00Z', resolvedAt: null },
+      ] });
+      await runSync(depsQ());
+      assert.equal(row('#123', 'Shravya')[COL.queueState], 'Changes Requested');
+      assert.equal(row('#123', 'Shravya')[COL.waitingOn], 'Rithika M');
+
+      timelines.set(123, { ...t, pushes: t.pushes.slice(0, 1), threads: [
+        { openedBy: SHRAVYA.uuid!, openedAt: '2026-09-21T08:59:00Z', resolvedAt: '2026-09-22T15:00:00Z' },
+      ] });
+      await runSync(depsQ());
+      assert.equal(row('#123', 'Shravya')[COL.queueState], 'Waiting for Re-review');
+      assert.equal(row('#123', 'Shravya')[COL.waitingOn], 'Shravya');
+      assert.equal(row('#123', 'Shravya')[COL.waitingSince], '2026-09-22 15:00:00');
+    });
+
+    it('engaged mode: an untouched PR shows up once, as Unassigned', async () => {
+      timelines.set(123, { pushes: [{ hash: B, at: '2026-09-01T10:00:00Z' }], reviews: [], mergedAt: null, commits: [B], threads: [] });
+      bb.put({ ...bb.prs.get(123)!, participants: [participant(RITHIKA_S, null), participant(SHRAVYA, null)] });
+      await runSync(depsQ());
+      const states = sheet.rows.map((r) => [r[COL.reviewer], r[COL.queueState], r[COL.waitingOn], r[COL.daysWaiting]]);
+      assert.deepEqual(states, [
+        ['Rithika S', 'Waiting for Review', 'Unassigned', 16], // weekdays after Tue 1 Sep up to Wed 23 Sep
+        ['Shravya', 'Optional', '', ''],
+      ]);
+    });
+
+    describe('rota mode', () => {
+      const rota = (from: string, to: string | null = null) => [{ developer: 'Rithika M', reviewers: ['Rithika S', 'Arjun'], from, to }];
+
+      it('rota reviewers own the review even before engaging; others are Optional', async () => {
+        sheet.rota = rota('2026-09-01');
+        const early = { uuid: '{00000000-0000}', display_name: 'Aaron' };
+        bb.put({ ...bb.prs.get(123)!, reviewers: [early, RITHIKA_S, SHRAVYA] });
+        const logger = recordingLogger();
+        await runSync(depsQ(logger));
+        assert.equal(row('#123', 'Rithika S')[COL.queueState], 'Waiting for Review');
+        assert.equal(row('#123', 'Rithika S')[COL.waitingOn], 'Rithika S');
+        assert.equal(row('#123', 'Shravya')[COL.queueState], 'Waiting for Re-review', 'engaged non-rota reviewer still counts');
+        assert.equal(row('#123', 'Aaron')[COL.queueState], 'Optional', 'never Unassigned in rota mode');
+        const missing = logger.events.find((e) => e.fields.action === 'ROTA_REVIEWER_NOT_ON_PR');
+        assert.equal(missing?.fields.missing, 'Arjun');
+      });
+
+      it('PRs created outside the rota dates stay in engaged mode', async () => {
+        sheet.rota = rota('2026-09-30');
+        await runSync(depsQ());
+        assert.equal(row('#123', 'Rithika S')[COL.queueState], 'Optional');
+        sheet.rota = rota('2026-08-01', '2026-08-31');
+        await runSync(depsQ());
+        assert.equal(row('#123', 'Rithika S')[COL.queueState], 'Optional');
+      });
+    });
+
+    it('L2 reviewers from Reviewer Levels get Waiting for L2 once L1 is done, and PR Queue State follows', async () => {
+      const stephen = { uuid: '{55555555-eeee}', display_name: 'Stephen Prabhu' };
+      sheet.levels.push({ reviewerId: null, reviewerName: 'Stephen Prabhu', level: 'L2' });
+      bb.put({
+        ...bb.prs.get(123)!,
+        reviewers: [RITHIKA_S, SHRAVYA, stephen],
+        participants: [participant(RITHIKA_S, 'approved'), participant(SHRAVYA, 'approved'), participant(stephen, null)],
+      });
+      const t = timelines.get(123) as PrTimeline;
+      timelines.set(123, {
+        ...t,
+        reviews: [
+          { reviewerId: RITHIKA_S.uuid!, kind: 'approval', at: '2026-09-22T09:00:00Z' },
+          { reviewerId: SHRAVYA.uuid!, kind: 'approval', at: '2026-09-22T10:00:00Z' },
+        ],
+      });
+      await runSync(depsQ());
+      assert.equal(row('#123', 'Stephen Prabhu')[COL.queueState], 'Waiting for L2');
+      assert.equal(row('#123', 'Stephen Prabhu')[COL.waitingOn], 'Stephen Prabhu');
+      assert.equal(row('#123', 'Stephen Prabhu')[COL.waitingSince], '2026-09-22 10:00:00');
+      assert.ok(sheet.rows.every((r) => r[COL.prQueueState] === 'Waiting for L2'), 'PR-level: same on every row');
+    });
+
+    it('marks an approved PR stacked on an open PR as Blocked by Dependency', async () => {
+      sheet.mappings.push({ ...MAPPING_123, prId: 124 });
+      bb.put(
+        makePr({
+          id: 124,
+          destination: { branch: { name: 'feature/pr-123' } },
+          reviewers: [ARJUN],
+          participants: [participant(ARJUN, 'approved')],
+        }),
+      );
+      await runSync(depsQ());
+      assert.equal(row('#124', 'Arjun')[COL.queueState], 'Blocked by Dependency');
+      assert.equal(row('#124', 'Arjun')[COL.waitingOn], '#123');
+      assert.equal(row('#124', 'Arjun')[COL.dependsOn], '#123');
+
+      sheet.mappings = sheet.mappings.map((m) => (m.prId === 124 ? { ...m, dependsOn: '-' } : m));
+      await runSync(depsQ());
+      assert.equal(row('#124', 'Arjun')[COL.queueState], 'Approved', 'mapping override: no dependency');
+      assert.equal(row('#124', 'Arjun')[COL.dependsOn], '');
+    });
+
+    it('takes a removed reviewer out of the queue', async () => {
+      await runSync(depsQ());
+      bb.put(makePr({ id: 123, reviewers: [SHRAVYA], participants: [participant(SHRAVYA, 'changes_requested')] }));
+      await runSync(depsQ());
+      assert.equal(row('#123', 'Rithika S')[COL.queueState], 'Removed');
+      assert.equal(row('#123', 'Rithika S')[COL.waitingOn], '');
+    });
+
+    it('a timeline failure skips only the queue columns', async () => {
+      timelines.set(123, new Error('bitbucket: HTTP 500'));
+      const logger = recordingLogger();
+      const s = await runSync(depsQ(logger));
+      assert.equal(s.failed, 0);
+      assert.equal(s.inserted, 2);
+      assert.ok(!(COL.queueState in row('#123', 'Shravya')));
+      assert.ok(logger.events.some((e) => e.fields.action === 'TIMELINE_FAILED'));
+    });
+
+    it('does not fetch timelines when the sheet has no queue columns', async () => {
+      sheet.headers = new Set(Object.values(COL).filter((c) => !(QUEUE_COLUMNS as string[]).includes(c)));
+      let fetched = 0;
+      await runSync({ ...deps(), timelines: { get: async () => (fetched++, timelines.get(123) as PrTimeline) } });
+      assert.equal(fetched, 0);
     });
   });
 

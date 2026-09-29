@@ -23,9 +23,33 @@ export interface Config {
     worksheetName: string;
     mappingWorksheetName: string | null;
     reviewerLevelsWorksheetName: string | null;
+    /** Review Rota worksheet (Developer, L1/L2 Reviewer, From, To). Null = engaged mode for every PR. */
+    reviewRotaWorksheetName: string | null;
     /** Worksheets listing interactives (Interactive Name, Interactive Type) for auto-detection. */
     interactiveWorksheetNames: string[];
     minRequestIntervalMs: number;
+  };
+  /** Jira Cloud, for the build tracker status refresh. Null when not configured. */
+  jira: {
+    baseUrl: string;
+    email: string;
+    apiToken: string;
+    /** Custom field holding story points (customfield_10028 on ei-study). */
+    storyPointsField: string;
+  } | null;
+  /** Zoho Cliq, for the PR digest. Uses the Zoho OAuth client above. */
+  cliq: {
+    apiUrl: string;
+    /** Unique name of the bot that sends the digest. */
+    botName: string;
+    /** Sheet name -> Cliq email, for people whose Cliq name differs from their Bitbucket name. */
+    userMap: Map<string, string>;
+  };
+  tracker: {
+    /** Tab with Ticket + Build Drop date: the date that decides which interactives are refreshed. */
+    buildSourceWorksheetName: string;
+    /** One row per due interactive: Jira phase progress and completion forecast. */
+    completionWorksheetName: string;
   };
   sync: {
     intervalMinutes: number;
@@ -83,6 +107,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     worksheetName: req('ZOHO_WORKSHEET_NAME'),
     mappingWorksheetName: opt('ZOHO_MAPPING_WORKSHEET_NAME'),
     reviewerLevelsWorksheetName: opt('ZOHO_REVIEWER_LEVELS_WORKSHEET_NAME'),
+    reviewRotaWorksheetName: opt('ZOHO_REVIEW_ROTA_WORKSHEET_NAME'),
     interactiveWorksheetNames: (opt('ZOHO_INTERACTIVE_WORKSHEETS') ?? '')
       .split(',')
       .map((s) => s.trim())
@@ -101,6 +126,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(`SHEET_TIMEZONE "${timezone}" is not a valid IANA time zone`);
   }
 
+  const jiraBaseUrl = opt('JIRA_BASE_URL');
+  const jiraEmail = opt('JIRA_EMAIL');
+  const jiraApiToken = opt('JIRA_API_TOKEN');
+  const jiraSet = [jiraBaseUrl, jiraEmail, jiraApiToken].filter(Boolean).length;
+  if (jiraSet > 0 && jiraSet < 3) {
+    throw new ConfigError('Set all of JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN, or none of them');
+  }
+
   const logFormat = opt('LOG_FORMAT') ?? 'text';
   if (logFormat !== 'text' && logFormat !== 'json') throw new ConfigError('LOG_FORMAT must be "text" or "json"');
 
@@ -113,6 +146,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       auth: auth!,
     },
     zoho,
+    jira: jiraSet
+      ? {
+          baseUrl: stripSlash(jiraBaseUrl!),
+          email: jiraEmail!,
+          apiToken: jiraApiToken!,
+          storyPointsField: opt('JIRA_STORY_POINTS_FIELD') ?? 'customfield_10028',
+        }
+      : null,
+    cliq: {
+      // Same data centre as the accounts server: accounts.zoho.in -> cliq.zoho.in
+      apiUrl: stripSlash(opt('CLIQ_API_URL') ?? zoho.accountsUrl.replace('://accounts.', '://cliq.')),
+      botName: opt('CLIQ_BOT_NAME') ?? 'prreviewdigest',
+      userMap: parseUserMap(opt('CLIQ_USER_MAP') ?? ''),
+    },
+    tracker: {
+      buildSourceWorksheetName: opt('TRACKER_BUILD_SOURCE_WORKSHEET') ?? 'Static Interactives',
+      completionWorksheetName: opt('TRACKER_COMPLETION_WORKSHEET') ?? 'INTERACTIVE_COMPLETION',
+    },
     sync: {
       intervalMinutes: num('SYNC_INTERVAL_MINUTES', 15),
       initialLookbackDays: num('SYNC_INITIAL_LOOKBACK_DAYS', 90),
@@ -150,7 +201,22 @@ export function secretValues(config: Config): string[] {
   const a = config.bitbucket.auth;
   const bb =
     a.kind === 'bearer' ? [a.token] : a.kind === 'basic' ? [a.password] : [a.clientId, a.clientSecret];
-  return [...bb, config.zoho.clientId, config.zoho.clientSecret, config.zoho.refreshToken].filter(Boolean);
+  return [...bb, config.zoho.clientId, config.zoho.clientSecret, config.zoho.refreshToken, config.jira?.apiToken ?? '']
+    .filter(Boolean);
+}
+
+/** "Stephen Prabhu=stephen@x.com; Other Name=other@x.com" -> name -> email */
+function parseUserMap(raw: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const pair of raw.split(';')) {
+    if (!pair.trim()) continue;
+    const [name, email] = pair.split('=').map((x) => x.trim());
+    if (!name || !email || !email.includes('@')) {
+      throw new ConfigError(`CLIQ_USER_MAP entry "${pair.trim()}" must look like "Sheet Name=email@example.com"`);
+    }
+    out.set(name.replace(/\s+/g, ' ').toLowerCase(), email.toLowerCase());
+  }
+  return out;
 }
 
 function stripSlash(s: string): string {
