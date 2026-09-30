@@ -550,7 +550,8 @@ npm run digest -- --send --to "Muthu Tharuunaditya R"
 npm run digest -- --evening --send               # everyone
 ```
 
-`.github/workflows/pr-digest.yml` sends the digest at **09:30 and 18:30 IST, Mon–Fri**. A manual run (*Run workflow*)
+`.github/workflows/pr-digest.yml` sends the digest at **08:47 and 18:30 IST, Mon–Fri** (GitHub often starts
+scheduled runs 10–30 minutes late). A manual run (*Run workflow*)
 is a dry run unless *Send* is ticked. It only reads the sheet, so it does not share the sync's concurrency group.
 
 ---

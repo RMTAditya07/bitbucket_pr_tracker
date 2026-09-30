@@ -4,7 +4,8 @@ name: PR digest → Zoho Cliq
 # reviews and re-reviews waiting on them. Sent as direct messages from the Cliq bot (CLIQ_BOT_NAME).
 on:
   schedule:
-    - cron: '0 4 * * 1-5' # 09:30 IST, Mon–Fri: morning digest (UTC; GitHub may delay a few minutes)
+    - cron: '17 3 * * 1-5' # 08:47 IST, Mon–Fri: morning digest. UTC; GitHub often starts scheduled runs
+    #                        10–30 min late (worst at the top of the hour), so this aims to land before 09:15
     - cron: '0 13 * * 1-5' # 18:30 IST, Mon–Fri: end-of-day digest
   workflow_dispatch:
     inputs:
